@@ -2,20 +2,42 @@
 
 `dtr` is a small Bash wrapper around `pacman`, `yay`, and the Arch User Repository. It provides readable commands for common package-management tasks without hiding the underlying tools.
 
+Source: https://github.com/Dexanir/dtr
+
 It does not perform partial upgrades. Package installation uses `pacman -S --needed`; full repository synchronization is performed only by the upgrade commands.
 
 ## Installation
+### Automated install
+
+Install with `curl`:
+
+```bash
+curl -fsSL https://dtr.dtrm.tech | sh
+```
+
+Or with `wget`:
+
+```bash
+wget -qO- https://dtr.dtrm.tech | sh
+```
+
+The installer downloads `dtr` from the repository's `master` branch, validates its Bash syntax, and installs it as `/usr/local/bin/dtr`. If GitHub raw content is unavailable, it falls back to `https://dtr.dtrm.tech/dtr`. It invokes `sudo` only for the final file installation.
+
+### From git
+Clone this repo and then install from a local checkout:
 
 ```bash
 sudo install -Dm755 dtr /usr/local/bin/dtr
 ```
 
-Run `dtr` as a regular user. Commands that modify the system invoke `sudo` for `pacman`; `yay` and `makepkg` remain under the calling user.
+### Note
+Always run `dtr` as a regular user. Commands that modify the system invoke `sudo` for `pacman`; `yay` and `makepkg` remain under the calling user.
 
 Requirements:
 
 - Arch Linux or an Arch-based distribution
 - Bash, `pacman`, and `sudo`
+- `curl` or `wget` for online installation
 - `yay` is optional but recommended for AUR packages
 - `python`, `git`, and `base-devel` are used by the direct AUR fallback
 - `pacman-contrib` enables more precise cache cleanup through `paccache`
