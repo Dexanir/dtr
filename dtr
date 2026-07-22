@@ -1,0 +1,565 @@
+#!/usr/bin/env bash
+# dtr — readable package-management wrapper for Arch Linux.
+set -Eeuo pipefail
+
+readonly DTR_VERSION="1.1.0"
+readonly AUR_RPC="https://aur.archlinux.org/rpc/v5"
+readonly AUR_GIT="https://aur.archlinux.org"
+
+if [[ -t 1 ]]; then
+    readonly BOLD=$'\e[1m'
+    readonly DIM=$'\e[2m'
+    readonly RED=$'\e[31m'
+    readonly YELLOW=$'\e[33m'
+    readonly RESET=$'\e[0m'
+else
+    readonly BOLD="" DIM="" RED="" YELLOW="" RESET=""
+fi
+
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s::%s %s\n' "$BOLD" "$RESET" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+run_root() {
+    if (( EUID == 0 )); then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+require_user() {
+    (( EUID != 0 )) || die "Run dtr as a regular user. It invokes sudo when needed; AUR packages must not be built as root."
+}
+
+require_args() {
+    local message=$1
+    shift
+    (( $# > 0 )) || die "$message"
+}
+
+usage() {
+    cat <<'HELP'
+dtr — readable package-management wrapper for pacman, yay, and the AUR
+
+Usage:
+  dtr install PKG...          Install packages: repositories -> yay -> direct AUR
+  dtr upgrade                 Upgrade repository and AUR packages
+  dtr repo-upgrade            Upgrade packages from official repositories only
+  dtr remove PKG...           Remove packages and unneeded dependencies
+  dtr search TEXT...          Search official repositories, then the AUR
+  dtr info PKG...             Show package information
+  dtr provides FILE|COMMAND   Find a package that provides a file or command
+  dtr provides --refresh ...  Refresh file databases before searching
+  dtr files-refresh           Refresh pacman file databases
+  dtr owns PATH...            Show which installed package owns a file
+  dtr installed [TEXT...]     List installed packages or search among them
+  dtr foreign                 List packages absent from current sync repositories
+  dtr orphans                 List orphaned dependencies
+  dtr clear --cache           Clean the package cache
+  dtr clear --orphaned        Remove orphaned dependencies
+  dtr clear --all             Clean cache and remove orphaned dependencies
+  dtr autoremove              Remove orphaned dependencies (legacy alias)
+  dtr clean                   Clean the package cache (legacy alias)
+  dtr raw PACMAN_ARGS...      Run pacman directly through sudo
+  dtr aur YAY_ARGS...         Run yay directly
+  dtr help                    Show this help
+
+Examples:
+  dtr install firefox visual-studio-code-bin
+  dtr search wireguard gui
+  dtr provides dig
+  dtr provides /usr/bin/convert
+  dtr owns /usr/bin/ssh
+  dtr clear --cache
+  dtr clear --orphaned
+HELP
+}
+
+python_cmd() {
+    if have python3; then
+        command -v python3
+    elif have python; then
+        command -v python
+    else
+        return 1
+    fi
+}
+
+aur_pkgbase() {
+    local pkg=$1 py
+    py=$(python_cmd) || return 2
+
+    "$py" - "$pkg" "$AUR_RPC" <<'PY'
+import json
+import sys
+import urllib.parse
+import urllib.request
+
+pkg, base_url = sys.argv[1:3]
+query = urllib.parse.urlencode([("arg[]", pkg)])
+request = urllib.request.Request(
+    f"{base_url}/info?{query}",
+    headers={"User-Agent": "dtr/1.0"},
+)
+try:
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.load(response)
+except Exception:
+    raise SystemExit(2)
+
+for item in payload.get("results", []):
+    if item.get("Name") == pkg:
+        print(item.get("PackageBase") or pkg)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+aur_info_rpc() {
+    local pkg=$1 py
+    py=$(python_cmd) || return 2
+
+    "$py" - "$pkg" "$AUR_RPC" <<'PY'
+import json
+import sys
+import urllib.parse
+import urllib.request
+
+pkg, base_url = sys.argv[1:3]
+query = urllib.parse.urlencode([("arg[]", pkg)])
+request = urllib.request.Request(
+    f"{base_url}/info?{query}",
+    headers={"User-Agent": "dtr/1.0"},
+)
+try:
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.load(response)
+except Exception as exc:
+    print(f"AUR RPC error: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+
+for item in payload.get("results", []):
+    if item.get("Name") != pkg:
+        continue
+    print(f"Repository      : aur")
+    print(f"Name            : {item.get('Name', '')}")
+    print(f"Version         : {item.get('Version', '')}")
+    print(f"Package Base    : {item.get('PackageBase', '')}")
+    print(f"Description     : {item.get('Description') or ''}")
+    print(f"URL             : {item.get('URL') or ''}")
+    print(f"Votes           : {item.get('NumVotes', 0)}")
+    print(f"Popularity      : {item.get('Popularity', 0)}")
+    print(f"Maintainer      : {item.get('Maintainer') or 'orphaned'}")
+    print(f"Out Of Date     : {'yes' if item.get('OutOfDate') else 'no'}")
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+aur_search_rpc() {
+    local query=$1 py
+    py=$(python_cmd) || return 2
+
+    "$py" - "$query" "$AUR_RPC" <<'PY'
+import json
+import sys
+import urllib.parse
+import urllib.request
+
+query, base_url = sys.argv[1:3]
+encoded = urllib.parse.quote(query, safe="")
+request = urllib.request.Request(
+    f"{base_url}/search/{encoded}?by=name-desc",
+    headers={"User-Agent": "dtr/1.0"},
+)
+try:
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.load(response)
+except Exception as exc:
+    print(f"AUR RPC error: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+
+items = payload.get("results", [])
+if not items:
+    raise SystemExit(1)
+
+items.sort(
+    key=lambda item: (
+        item.get("Name", "") != query,
+        -(item.get("Popularity") or 0),
+        item.get("Name", ""),
+    )
+)
+for item in items[:50]:
+    orphaned = " [orphaned]" if not item.get("Maintainer") else ""
+    outdated = " [out-of-date]" if item.get("OutOfDate") else ""
+    print(f"aur/{item.get('Name')} {item.get('Version')}{orphaned}{outdated}")
+    print(f"    {item.get('Description') or ''}")
+PY
+}
+
+repo_has_target() {
+    local pkg=$1
+    pacman -Si "$pkg" >/dev/null 2>&1 || pacman -Sg "$pkg" >/dev/null 2>&1
+}
+
+yay_has_package() {
+    local pkg=$1
+    have yay && yay -Si --aur "$pkg" >/dev/null 2>&1
+}
+
+direct_aur_pkgbase() {
+    local pkg=$1 base=""
+
+    if base=$(aur_pkgbase "$pkg" 2>/dev/null); then
+        printf '%s\n' "$base"
+        return 0
+    fi
+
+    # RPC unavailable or Python absent: exact package-base fallback.
+    if have git && git ls-remote "$AUR_GIT/$pkg.git" HEAD >/dev/null 2>&1; then
+        printf '%s\n' "$pkg"
+        return 0
+    fi
+
+    return 1
+}
+
+manual_aur_install() {
+    local pkg=$1 pkgbase=$2
+    require_user
+
+    if ! have git || ! have makepkg; then
+        info "Direct AUR builds require git and base-devel."
+        run_root pacman -S --needed git base-devel
+    fi
+
+    (
+        local workdir answer pager
+        workdir=$(mktemp -d "${TMPDIR:-/tmp}/dtr-aur.XXXXXXXX")
+        trap 'rm -rf "$workdir"' EXIT
+
+        info "AUR fallback: $pkg (package base: $pkgbase)"
+        git clone --quiet "$AUR_GIT/$pkgbase.git" "$workdir/$pkgbase"
+        cd "$workdir/$pkgbase"
+
+        say "${DIM}Source: $AUR_GIT/packages/$pkg${RESET}"
+        say "${YELLOW}An AUR PKGBUILD runs with your user privileges. Review it before building.${RESET}"
+
+        if [[ "${DTR_AUR_REVIEW:-1}" != "0" ]]; then
+            if [[ -t 0 ]]; then
+                pager=${PAGER:-less}
+                if have "${pager%% *}"; then
+                    # shellcheck disable=SC2086
+                    $pager PKGBUILD
+                else
+                    sed -n '1,240p' PKGBUILD
+                fi
+                read -r -p "Build and install $pkg? [y/N] " answer
+                [[ $answer =~ ^[Yy]$ ]] || die "Cancelled."
+            elif [[ "${DTR_AUR_ASSUME_YES:-0}" != "1" ]]; then
+                die "Non-interactive AUR builds are disabled. Set DTR_AUR_ASSUME_YES=1 explicitly to allow them."
+            fi
+        fi
+
+        makepkg -si
+    )
+}
+
+install_packages() {
+    require_user
+    require_args "Specify at least one package: dtr install <package>..." "$@"
+
+    local pkg base
+    local -a repo_packages=() yay_packages=() direct_names=() direct_bases=() missing=()
+
+    for pkg in "$@"; do
+        if repo_has_target "$pkg"; then
+            repo_packages+=("$pkg")
+        elif yay_has_package "$pkg"; then
+            yay_packages+=("$pkg")
+        elif base=$(direct_aur_pkgbase "$pkg"); then
+            direct_names+=("$pkg")
+            direct_bases+=("$base")
+        else
+            missing+=("$pkg")
+        fi
+    done
+
+    if (( ${#repo_packages[@]} )); then
+        info "Official repositories: ${repo_packages[*]}"
+        run_root pacman -S --needed "${repo_packages[@]}"
+    fi
+
+    if (( ${#yay_packages[@]} )); then
+        info "AUR via yay: ${yay_packages[*]}"
+        yay -S --needed --aur "${yay_packages[@]}"
+    fi
+
+    local i
+    for (( i=0; i<${#direct_names[@]}; i++ )); do
+        manual_aur_install "${direct_names[$i]}" "${direct_bases[$i]}"
+    done
+
+    if (( ${#missing[@]} )); then
+        warn "Not found: ${missing[*]}"
+        warn "Check the spelling or run: dtr search ${missing[0]}"
+        return 1
+    fi
+}
+
+upgrade_system() {
+    require_user
+    if have yay; then
+        yay -Syu
+    else
+        run_root pacman -Syu
+        warn "yay is not installed; only official repository packages were upgraded."
+    fi
+}
+
+search_packages() {
+    require_args "Specify a search query: dtr search <text>..." "$@"
+    local query=$* found=1
+
+    say "${BOLD}==> Official repositories${RESET}"
+    if pacman -Ss "$@"; then
+        found=0
+    else
+        say "    No matches found."
+    fi
+
+    say
+    say "${BOLD}==> AUR${RESET}"
+    if have yay; then
+        if yay -Ss --aur "$@"; then
+            found=0
+        else
+            say "    No matches found."
+        fi
+    elif aur_search_rpc "$query"; then
+        found=0
+    else
+        say "    No matches found, or the AUR RPC is unavailable."
+        have python || warn "The python package is required for direct AUR searches when yay is unavailable."
+    fi
+
+    return "$found"
+}
+
+package_info() {
+    require_args "Specify a package: dtr info <package>..." "$@"
+    local pkg status=0
+
+    for pkg in "$@"; do
+        if pacman -Si "$pkg"; then
+            :
+        elif have yay && yay -Si --aur "$pkg"; then
+            :
+        elif aur_info_rpc "$pkg"; then
+            :
+        else
+            warn "Package not found: $pkg"
+            status=1
+        fi
+        (( $# > 1 )) && say
+    done
+    return "$status"
+}
+
+files_db_needs_refresh() {
+    local -a dbs=()
+    shopt -s nullglob
+    dbs=(/var/lib/pacman/sync/*.files)
+    shopt -u nullglob
+
+    (( ${#dbs[@]} > 0 )) || return 0
+    find /var/lib/pacman/sync -maxdepth 1 -type f -name '*.files' -mtime +7 -print -quit 2>/dev/null | grep -q .
+}
+
+refresh_files_db() {
+    info "Refreshing pacman file databases..."
+    run_root pacman -Fy
+}
+
+provides_one() {
+    local target=${1#/} status=1
+
+    # A bare word is most often a missing executable.
+    if [[ $target != */* ]]; then
+        if pacman -F "usr/bin/$target"; then
+            return 0
+        fi
+    fi
+
+    if pacman -F "$target"; then
+        status=0
+    fi
+    return "$status"
+}
+
+provides_files() {
+    local force_refresh=0 target status=0
+
+    if [[ ${1:-} == "--refresh" ]]; then
+        force_refresh=1
+        shift
+    fi
+    require_args "Specify a file or command: dtr provides <file|command>..." "$@"
+
+    if (( force_refresh )) || files_db_needs_refresh; then
+        refresh_files_db
+    fi
+
+    for target in "$@"; do
+        info "Searching repository file databases for: $target"
+        if ! provides_one "$target"; then
+            warn "No matching package found: $target"
+            status=1
+        fi
+    done
+    return "$status"
+}
+
+list_orphans() {
+    local -a packages=()
+    mapfile -t packages < <(pacman -Qdtq)
+    if (( ${#packages[@]} == 0 )); then
+        say "No orphaned dependencies found. A rare moment of package-manager harmony."
+    else
+        printf '%s\n' "${packages[@]}"
+    fi
+}
+
+autoremove() {
+    local -a packages=()
+    mapfile -t packages < <(pacman -Qdtq)
+    if (( ${#packages[@]} == 0 )); then
+        say "Nothing to remove."
+        return 0
+    fi
+    run_root pacman -Rns "${packages[@]}"
+}
+
+clean_cache() {
+    if have paccache; then
+        run_root paccache -rk2
+        run_root paccache -ruk0
+    else
+        warn "paccache was not found; falling back to the less precise pacman -Sc. Install pacman-contrib for better cache cleanup."
+        run_root pacman -Sc
+    fi
+}
+
+clear_packages() {
+    require_args "Specify what to clear: dtr clear --cache|--orphaned|--all" "$@"
+
+    local option
+    local clear_cache=0
+    local clear_orphaned=0
+
+    for option in "$@"; do
+        case "$option" in
+            --cache|cache)
+                clear_cache=1
+                ;;
+            --orphaned|orphaned|--orphans|orphans)
+                clear_orphaned=1
+                ;;
+            --all|all)
+                clear_cache=1
+                clear_orphaned=1
+                ;;
+            *)
+                die "Unknown clear option: $option. Use --cache, --orphaned, or --all."
+                ;;
+        esac
+    done
+
+    (( clear_orphaned == 0 )) || autoremove
+    (( clear_cache == 0 )) || clean_cache
+}
+
+main() {
+    local command=${1:-help}
+    [[ $# -eq 0 ]] || shift
+
+    case "$command" in
+        install|add|in)
+            install_packages "$@"
+            ;;
+        upgrade|update|up)
+            upgrade_system
+            ;;
+        repo-upgrade|system-upgrade)
+            run_root pacman -Syu
+            ;;
+        remove|delete|rm|uninstall)
+            require_args "Specify a package: dtr remove <package>..." "$@"
+            run_root pacman -Rns "$@"
+            ;;
+        search|find)
+            search_packages "$@"
+            ;;
+        info|show)
+            package_info "$@"
+            ;;
+        provides|provider)
+            provides_files "$@"
+            ;;
+        files-refresh)
+            refresh_files_db
+            ;;
+        owns|owner)
+            require_args "Specify a local path: dtr owns <path>..." "$@"
+            pacman -Qo "$@"
+            ;;
+        installed|list)
+            if (( $# )); then
+                pacman -Qs "$@"
+            else
+                pacman -Q
+            fi
+            ;;
+        foreign|aur-installed)
+            pacman -Qm
+            ;;
+        orphans)
+            list_orphans
+            ;;
+        clear)
+            clear_packages "$@"
+            ;;
+        autoremove)
+            autoremove
+            ;;
+        clean)
+            clean_cache
+            ;;
+        raw|pacman)
+            require_args "Specify pacman arguments: dtr raw ..." "$@"
+            run_root pacman "$@"
+            ;;
+        aur|yay)
+            require_user
+            have yay || die "yay is not installed."
+            yay "$@"
+            ;;
+        version|--version|-V)
+            say "dtr $DTR_VERSION"
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        *)
+            warn "Unknown command: $command"
+            usage
+            return 2
+            ;;
+    esac
+}
+
+main "$@"
