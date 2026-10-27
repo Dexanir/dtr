@@ -2,7 +2,7 @@
 # dtr — readable package-management wrapper for Arch Linux.
 set -Eeuo pipefail
 
-readonly DTR_VERSION="1.1.0"
+readonly DTR_VERSION="1.1.1"
 readonly AUR_RPC="https://aur.archlinux.org/rpc/v5"
 readonly AUR_GIT="https://aur.archlinux.org"
 
@@ -45,7 +45,7 @@ usage() {
 dtr — readable package-management wrapper for pacman, yay, and the AUR
 
 Usage:
-  dtr install PKG...          Install packages: repositories -> yay -> direct AUR
+  dtr install PKG...          Full upgrade, then install: repositories -> yay -> direct AUR
   dtr upgrade                 Upgrade repository and AUR packages
   dtr repo-upgrade            Upgrade packages from official repositories only
   dtr remove PKG...           Remove packages and unneeded dependencies
@@ -274,11 +274,36 @@ install_packages() {
     require_args "Specify at least one package: dtr install <package>..." "$@"
 
     local pkg base
-    local -a repo_packages=() yay_packages=() direct_names=() direct_bases=() missing=()
+    local -a repo_packages=() unresolved=() new_repo_packages=()
+    local -a yay_packages=() direct_names=() direct_bases=() missing=()
 
+    # The existing sync database may be stale. Use it only to select targets
+    # for the initial full-upgrade transaction, not to make final AUR decisions.
     for pkg in "$@"; do
         if repo_has_target "$pkg"; then
             repo_packages+=("$pkg")
+        else
+            unresolved+=("$pkg")
+        fi
+    done
+
+    info "Synchronizing repositories and performing a full system upgrade before installation."
+    if (( ${#repo_packages[@]} )); then
+        info "Repository targets: ${repo_packages[*]}"
+        if ! run_root pacman -Syu --needed "${repo_packages[@]}"; then
+            warn "Repository upgrade/install failed or was cancelled. No AUR fallback will be attempted."
+            return 1
+        fi
+    elif ! run_root pacman -Syu; then
+        warn "Repository upgrade failed or was cancelled. No AUR fallback will be attempted."
+        return 1
+    fi
+
+    # A package that was absent from an old database may now exist in a repo.
+    # Only use yay/AUR after the refreshed repository database is checked.
+    for pkg in "${unresolved[@]}"; do
+        if repo_has_target "$pkg"; then
+            new_repo_packages+=("$pkg")
         elif yay_has_package "$pkg"; then
             yay_packages+=("$pkg")
         elif base=$(direct_aur_pkgbase "$pkg"); then
@@ -289,9 +314,9 @@ install_packages() {
         fi
     done
 
-    if (( ${#repo_packages[@]} )); then
-        info "Official repositories: ${repo_packages[*]}"
-        run_root pacman -S --needed "${repo_packages[@]}"
+    if (( ${#new_repo_packages[@]} )); then
+        info "Newly available repository targets: ${new_repo_packages[*]}"
+        run_root pacman -S --needed "${new_repo_packages[@]}"
     fi
 
     if (( ${#yay_packages[@]} )); then
